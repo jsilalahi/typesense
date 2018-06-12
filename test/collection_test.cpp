@@ -138,6 +138,11 @@ TEST_F(CollectionTest, ExactPhraseSearch) {
         ASSERT_STREQ(id.c_str(), result_id.c_str());
     }
 
+    ASSERT_EQ(results["hits"][0]["highlights"].size(), (unsigned long) 1);
+    ASSERT_STREQ(results["hits"][0]["highlights"][0]["field"].get<std::string>().c_str(), "title");
+    ASSERT_STREQ(results["hits"][0]["highlights"][0]["snippet"].get<std::string>().c_str(),
+                 "What is the power requirement of a <mark>rocket</mark> <mark>launch</mark> these days?");
+
     // Check ASC sort order
     std::vector<sort_by> sort_fields_asc = { sort_by("points", "ASC") };
     results = collection->search("rocket launch", query_fields, "", facets, sort_fields_asc, 0, 10).get();
@@ -206,6 +211,28 @@ TEST_F(CollectionTest, SkipUnindexedTokensDuringPhraseSearch) {
         ASSERT_STREQ(id.c_str(), result_id.c_str());
     }
 
+    // should not try to drop tokens to expand query
+    results.clear();
+    results = collection->search("the a", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY, false, 10).get();
+    ASSERT_EQ(8, results["hits"].size());
+
+    results.clear();
+    results = collection->search("the a", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY, false, 0).get();
+    ASSERT_EQ(3, results["hits"].size());
+    ids = {"8", "16", "10"};
+
+    for(size_t i = 0; i < results["hits"].size(); i++) {
+        nlohmann::json result = results["hits"].at(i);
+        std::string id = ids.at(i);
+        std::string result_id = result["document"]["id"];
+        ASSERT_STREQ(id.c_str(), result_id.c_str());
+    }
+
+    results.clear();
+    results = collection->search("the a DoesNotExist", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY, false, 0).get();
+    ASSERT_EQ(0, results["hits"].size());
+
+    // with no indexed word
     results.clear();
     results = collection->search("DoesNotExist1 DoesNotExist2", query_fields, "", facets, sort_fields, 0, 10).get();
     ASSERT_EQ(0, results["hits"].size());
@@ -390,6 +417,21 @@ TEST_F(CollectionTest, Pagination) {
     }
 }
 
+TEST_F(CollectionTest, WildcardQuery) {
+    nlohmann::json results = collection->search("*", query_fields, "points:>0", {}, sort_fields, 0, 3, 1, FREQUENCY,
+                                                false).get();
+    ASSERT_EQ(3, results["hits"].size());
+    ASSERT_EQ(25, results["found"].get<uint32_t>());
+
+    // when no filter is specified, fall back on default sorting field based catch-all filter
+    Option<nlohmann::json> results_op = collection->search("*", query_fields, "", {}, sort_fields, 0, 3, 1, FREQUENCY,
+                                                           false);
+
+    ASSERT_TRUE(results_op.ok());
+    ASSERT_EQ(3, results["hits"].size());
+    ASSERT_EQ(25, results["found"].get<uint32_t>());
+}
+
 TEST_F(CollectionTest, PrefixSearching) {
     std::vector<std::string> facets;
     nlohmann::json results = collection->search("ex", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY, true).get();
@@ -457,12 +499,177 @@ TEST_F(CollectionTest, PrefixSearching) {
     ASSERT_EQ(0, results["hits"].size());
 
     results = collection->search("xq", query_fields, "", facets, sort_fields, 2, 2, 1, FREQUENCY, true).get();
-    ASSERT_EQ(0, results["hits"].size());
+    ASSERT_EQ(1, results["hits"].size());
+    ids = {"6"};
+
+    for(size_t i = 0; i < results["hits"].size(); i++) {
+        nlohmann::json result = results["hits"].at(i);
+        std::string result_id = result["document"]["id"];
+        std::string id = ids.at(i);
+        ASSERT_STREQ(id.c_str(), result_id.c_str());
+    }
 
     // prefix with a typo
     results = collection->search("late propx", query_fields, "", facets, sort_fields, 2, 1, 1, FREQUENCY, true).get();
     ASSERT_EQ(1, results["hits"].size());
     ASSERT_EQ("16", results["hits"].at(0)["document"]["id"]);
+}
+
+TEST_F(CollectionTest, ArrayStringFieldHighlight) {
+    Collection *coll_array_text;
+
+    std::ifstream infile(std::string(ROOT_DIR) + "test/array_text_documents.jsonl");
+    std::vector<field> fields = {
+            field("title", field_types::STRING, false),
+            field("tags", field_types::STRING_ARRAY, false),
+            field("points", field_types::INT32, false)
+    };
+
+    coll_array_text = collectionManager.get_collection("coll_array_text");
+    if (coll_array_text == nullptr) {
+        coll_array_text = collectionManager.create_collection("coll_array_text", fields, "points").get();
+    }
+
+    std::string json_line;
+
+    while (std::getline(infile, json_line)) {
+        coll_array_text->add(json_line);
+    }
+
+    infile.close();
+
+    query_fields = {"tags"};
+    std::vector<std::string> facets;
+
+    nlohmann::json results = coll_array_text->search("truth about", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY,
+                                                     false, 0).get();
+    ASSERT_EQ(1, results["hits"].size());
+
+    std::vector<std::string> ids = {"0"};
+
+    for (size_t i = 0; i < results["hits"].size(); i++) {
+        nlohmann::json result = results["hits"].at(i);
+        std::string result_id = result["document"]["id"];
+        std::string id = ids.at(i);
+        ASSERT_STREQ(id.c_str(), result_id.c_str());
+    }
+
+    ASSERT_EQ(results["hits"][0]["highlights"].size(), 1);
+    ASSERT_STREQ(results["hits"][0]["highlights"][0]["field"].get<std::string>().c_str(), "tags");
+
+    // an array's snippets must be sorted on match score, if match score is same, priority to be given to lower indices
+    ASSERT_EQ(3, results["hits"][0]["highlights"][0]["snippets"].size());
+    ASSERT_STREQ("<mark>truth</mark> <mark>about</mark>", results["hits"][0]["highlights"][0]["snippets"][0].get<std::string>().c_str());
+    ASSERT_STREQ("the <mark>truth</mark>", results["hits"][0]["highlights"][0]["snippets"][1].get<std::string>().c_str());
+    ASSERT_STREQ("<mark>about</mark> forever", results["hits"][0]["highlights"][0]["snippets"][2].get<std::string>().c_str());
+
+    ASSERT_EQ(3, results["hits"][0]["highlights"][0]["indices"].size());
+    ASSERT_EQ(2, results["hits"][0]["highlights"][0]["indices"][0]);
+    ASSERT_EQ(0, results["hits"][0]["highlights"][0]["indices"][1]);
+    ASSERT_EQ(1, results["hits"][0]["highlights"][0]["indices"][2]);
+
+    results = coll_array_text->search("forever truth", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY,
+                                      false, 0).get();
+    ASSERT_EQ(1, results["hits"].size());
+
+    ids = {"0"};
+
+    for (size_t i = 0; i < results["hits"].size(); i++) {
+        nlohmann::json result = results["hits"].at(i);
+        std::string result_id = result["document"]["id"];
+        std::string id = ids.at(i);
+        ASSERT_STREQ(id.c_str(), result_id.c_str());
+    }
+
+    ASSERT_STREQ(results["hits"][0]["highlights"][0]["field"].get<std::string>().c_str(), "tags");
+    ASSERT_EQ(3, results["hits"][0]["highlights"][0]["snippets"].size());
+    ASSERT_STREQ("the <mark>truth</mark>", results["hits"][0]["highlights"][0]["snippets"][0].get<std::string>().c_str());
+    ASSERT_STREQ("about <mark>forever</mark>", results["hits"][0]["highlights"][0]["snippets"][1].get<std::string>().c_str());
+    ASSERT_STREQ("<mark>truth</mark> about", results["hits"][0]["highlights"][0]["snippets"][2].get<std::string>().c_str());
+    ASSERT_EQ(3, results["hits"][0]["highlights"][0]["indices"].size());
+    ASSERT_EQ(0, results["hits"][0]["highlights"][0]["indices"][0]);
+    ASSERT_EQ(1, results["hits"][0]["highlights"][0]["indices"][1]);
+    ASSERT_EQ(2, results["hits"][0]["highlights"][0]["indices"][2]);
+
+    results = coll_array_text->search("truth", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY,
+                                      false, 0).get();
+    ASSERT_EQ(2, results["hits"].size());
+
+    ids = {"0", "1"};
+
+    for (size_t i = 0; i < results["hits"].size(); i++) {
+        nlohmann::json result = results["hits"].at(i);
+        std::string result_id = result["document"]["id"];
+        std::string id = ids.at(i);
+        ASSERT_STREQ(id.c_str(), result_id.c_str());
+    }
+
+    results = coll_array_text->search("asdadasd", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY,
+                                      false, 0).get();
+    ASSERT_EQ(0, results["hits"].size());
+
+    query_fields = {"title", "tags"};
+    results = coll_array_text->search("truth", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY,
+                                      false, 0).get();
+    ASSERT_EQ(2, results["hits"].size());
+    ASSERT_EQ(2, results["hits"][0]["highlights"].size());
+
+    ids = {"0", "1"};
+
+    for (size_t i = 0; i < results["hits"].size(); i++) {
+        nlohmann::json result = results["hits"].at(i);
+        std::string result_id = result["document"]["id"];
+        std::string id = ids.at(i);
+        ASSERT_STREQ(id.c_str(), result_id.c_str());
+    }
+
+    ASSERT_EQ(2, results["hits"][0]["highlights"][0].size());
+    ASSERT_STREQ(results["hits"][0]["highlights"][0]["field"].get<std::string>().c_str(), "title");
+    ASSERT_STREQ(results["hits"][0]["highlights"][0]["snippet"].get<std::string>().c_str(), "The <mark>Truth</mark> About Forever");
+
+    ASSERT_EQ(3, results["hits"][0]["highlights"][1].size());
+    ASSERT_STREQ(results["hits"][0]["highlights"][1]["field"].get<std::string>().c_str(), "tags");
+    ASSERT_EQ(2, results["hits"][0]["highlights"][1]["snippets"].size());
+    ASSERT_STREQ("the <mark>truth</mark>", results["hits"][0]["highlights"][1]["snippets"][0].get<std::string>().c_str());
+    ASSERT_STREQ("<mark>truth</mark> about", results["hits"][0]["highlights"][1]["snippets"][1].get<std::string>().c_str());
+
+    ASSERT_EQ(2, results["hits"][0]["highlights"][1]["indices"].size());
+    ASSERT_EQ(0, results["hits"][0]["highlights"][1]["indices"][0]);
+    ASSERT_EQ(2, results["hits"][0]["highlights"][1]["indices"][1]);
+
+    ASSERT_EQ(2, results["hits"][1]["highlights"][0].size());
+    ASSERT_STREQ(results["hits"][1]["highlights"][0]["field"].get<std::string>().c_str(), "title");
+    ASSERT_STREQ(results["hits"][1]["highlights"][0]["snippet"].get<std::string>().c_str(), "Plain <mark>Truth</mark>");
+
+    ASSERT_EQ(3, results["hits"][1]["highlights"][1].size());
+    ASSERT_STREQ(results["hits"][1]["highlights"][1]["field"].get<std::string>().c_str(), "tags");
+
+    ASSERT_EQ(2, results["hits"][1]["highlights"][1]["snippets"].size());
+    ASSERT_STREQ("<mark>truth</mark>", results["hits"][1]["highlights"][1]["snippets"][0].get<std::string>().c_str());
+    ASSERT_STREQ("plain <mark>truth</mark>", results["hits"][1]["highlights"][1]["snippets"][1].get<std::string>().c_str());
+
+    ASSERT_EQ(2, results["hits"][1]["highlights"][1]["indices"].size());
+    ASSERT_EQ(1, results["hits"][1]["highlights"][1]["indices"][0]);
+    ASSERT_EQ(2, results["hits"][1]["highlights"][1]["indices"][1]);
+
+    // highlight fields must be ordered based on match score
+    results = coll_array_text->search("amazing movie", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY,
+                                      false, 0).get();
+    ASSERT_EQ(1, results["hits"].size());
+    ASSERT_EQ(2, results["hits"][0]["highlights"].size());
+
+    ASSERT_EQ(3, results["hits"][0]["highlights"][0].size());
+    ASSERT_STREQ("tags", results["hits"][0]["highlights"][0]["field"].get<std::string>().c_str());
+    ASSERT_STREQ("<mark>amazing</mark> <mark>movie</mark>", results["hits"][0]["highlights"][0]["snippets"][0].get<std::string>().c_str());
+    ASSERT_EQ(1, results["hits"][0]["highlights"][0]["indices"].size());
+    ASSERT_EQ(0, results["hits"][0]["highlights"][0]["indices"][0]);
+
+    ASSERT_EQ(2, results["hits"][0]["highlights"][1].size());
+    ASSERT_STREQ(results["hits"][0]["highlights"][1]["field"].get<std::string>().c_str(), "title");
+    ASSERT_STREQ(results["hits"][0]["highlights"][1]["snippet"].get<std::string>().c_str(),
+                 "<mark>Amazing</mark> Spiderman is <mark>amazing</mark>"); // should highlight duplicating tokens
+
+    collectionManager.drop_collection("coll_array_text");
 }
 
 TEST_F(CollectionTest, MultipleFields) {
@@ -512,7 +719,7 @@ TEST_F(CollectionTest, MultipleFields) {
     results = coll_mul_fields->search("thomas", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY, false).get();
     ASSERT_EQ(4, results["hits"].size());
 
-    ids = {"15", "14", "12", "13"};
+    ids = {"15", "12", "13", "14"};
 
     for(size_t i = 0; i < results["hits"].size(); i++) {
         nlohmann::json result = results["hits"].at(i);
@@ -554,6 +761,18 @@ TEST_F(CollectionTest, MultipleFields) {
     results = coll_mul_fields->search("captain", query_fields, "cast: chris", facets, sort_fields, 0, 10, 1, FREQUENCY, false).get();
     ASSERT_EQ(1, results["hits"].size());
     ids = {"6"};
+    for(size_t i = 0; i < results["hits"].size(); i++) {
+        nlohmann::json result = results["hits"].at(i);
+        std::string result_id = result["document"]["id"];
+        std::string id = ids.at(i);
+        ASSERT_STREQ(id.c_str(), result_id.c_str());
+    }
+
+    // when a token exists in multiple fields of the same document, document should be returned only once
+    query_fields = {"starring", "title", "cast"};
+    results = coll_mul_fields->search("myers", query_fields, "", facets, sort_fields, 0, 10, 1, FREQUENCY, false).get();
+    ASSERT_EQ(1, results["hits"].size());
+    ids = {"17"};
     for(size_t i = 0; i < results["hits"].size(); i++) {
         nlohmann::json result = results["hits"].at(i);
         std::string result_id = result["document"]["id"];
@@ -1408,6 +1627,20 @@ TEST_F(CollectionTest, SearchingWithMissingFields) {
     collectionManager.drop_collection("coll_array_fields");
 }
 
+TEST_F(CollectionTest, DefaultSortingFieldMustBeInt32OrFloat) {
+    std::vector<field> fields = {field("name", field_types::STRING, false),
+                                 field("tags", field_types::STRING_ARRAY, true),
+                                 field("age", field_types::INT32, false),
+                                 field("average", field_types::INT32, false) };
+
+    std::vector<sort_by> sort_fields = { sort_by("age", "DESC"), sort_by("average", "DESC") };
+
+    Option<Collection*> collection_op = collectionManager.create_collection("sample_collection", fields, "name");
+    EXPECT_FALSE(collection_op.ok());
+    EXPECT_EQ("Default sorting field `name` must be of type int32 or float.", collection_op.error());
+    collectionManager.drop_collection("sample_collection");
+}
+
 TEST_F(CollectionTest, IndexingWithBadData) {
     // should not crash when document to-be-indexed doesn't match schema
     Collection *sample_collection;
@@ -1459,7 +1692,7 @@ TEST_F(CollectionTest, IndexingWithBadData) {
     doc_str = "{\"name\": \"foo\", \"age\": \"34\", \"tags\": [], \"average\": 34 }";
     const Option<nlohmann::json> & bad_default_sorting_field_op1 = sample_collection->add(doc_str);
     ASSERT_FALSE(bad_default_sorting_field_op1.ok());
-    ASSERT_STREQ("Default sorting field `age` must be a number.", bad_default_sorting_field_op1.error().c_str());
+    ASSERT_STREQ("Default sorting field `age` must be of type int32 or float.", bad_default_sorting_field_op1.error().c_str());
 
     doc_str = "{\"name\": \"foo\", \"age\": 343234324234233234, \"tags\": [], \"average\": 34 }";
     const Option<nlohmann::json> & bad_default_sorting_field_op2 = sample_collection->add(doc_str);
@@ -1644,4 +1877,85 @@ TEST_F(CollectionTest, DeletionOfADocument) {
     ASSERT_EQ(3, num_keys);
 
     collectionManager.drop_collection("collection_for_del");
+}
+
+nlohmann::json get_prune_doc() {
+    nlohmann::json document;
+    document["one"] = 1;
+    document["two"] = 2;
+    document["three"] = 3;
+    document["four"] = 4;
+
+    return document;
+}
+
+TEST_F(CollectionTest, SearchLargeTextField) {
+    Collection *coll_large_text;
+
+    std::vector<field> fields = {field("text", field_types::STRING, false),
+                                 field("age", field_types::INT32, false),
+    };
+
+    std::vector<sort_by> sort_fields = { sort_by("age", "DESC") };
+
+    coll_large_text = collectionManager.get_collection("coll_large_text");
+    if(coll_large_text == nullptr) {
+        coll_large_text = collectionManager.create_collection("coll_large_text", fields, "age").get();
+    }
+
+    std::string json_line;
+    std::ifstream infile(std::string(ROOT_DIR)+"test/large_text_field.jsonl");
+
+    while (std::getline(infile, json_line)) {
+        coll_large_text->add(json_line);
+    }
+
+    infile.close();
+
+    Option<nlohmann::json> res_op = coll_large_text->search("eguilazer", {"text"}, "", {}, sort_fields, 0, 10);
+    ASSERT_TRUE(res_op.ok());
+    nlohmann::json results = res_op.get();
+    ASSERT_EQ(1, results["hits"].size());
+
+    res_op = coll_large_text->search("tristique", {"text"}, "", {}, sort_fields, 0, 10);
+    ASSERT_TRUE(res_op.ok());
+    results = res_op.get();
+    ASSERT_EQ(2, results["hits"].size());
+
+    collectionManager.drop_collection("coll_large_text");
+}
+
+TEST_F(CollectionTest, PruneFieldsFromDocument) {
+    nlohmann::json document = get_prune_doc();
+    Collection::prune_document(document, {"one", "two"}, spp::sparse_hash_set<std::string>());
+    ASSERT_EQ(2, document.size());
+    ASSERT_EQ(1, document["one"]);
+    ASSERT_EQ(2, document["two"]);
+
+    // exclude takes precedence
+    document = get_prune_doc();
+    Collection::prune_document(document, {"one"}, {"one"});
+    ASSERT_EQ(0, document.size());
+
+    // when no inclusion is specified, should return all fields not mentioned by exclusion list
+    document = get_prune_doc();
+    Collection::prune_document(document, spp::sparse_hash_set<std::string>(), {"three"});
+    ASSERT_EQ(3, document.size());
+    ASSERT_EQ(1, document["one"]);
+    ASSERT_EQ(2, document["two"]);
+    ASSERT_EQ(4, document["four"]);
+
+    document = get_prune_doc();
+    Collection::prune_document(document, spp::sparse_hash_set<std::string>(), spp::sparse_hash_set<std::string>());
+    ASSERT_EQ(4, document.size());
+
+    // when included field does not exist
+    document = get_prune_doc();
+    Collection::prune_document(document, {"notfound"}, spp::sparse_hash_set<std::string>());
+    ASSERT_EQ(0, document.size());
+
+    // when excluded field does not exist
+    document = get_prune_doc();
+    Collection::prune_document(document, spp::sparse_hash_set<std::string>(), {"notfound"});
+    ASSERT_EQ(4, document.size());
 }

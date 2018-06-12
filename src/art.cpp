@@ -905,15 +905,12 @@ int art_topk_iter(const art_node *root, token_ordering token_order, size_t max_r
                          std::vector<art_leaf *> &results) {
     printf("INSIDE art_topk_iter: root->type: %d\n", root->type);
 
-    std::priority_queue<art_node *, std::vector<const art_node *>,
-            std::function<bool(const art_node*, const art_node*)>> q;
+    std::priority_queue<const art_node *, std::vector<const art_node *>,
+            decltype(&compare_art_node_score_pq)> q(compare_art_node_score_pq);
 
     if(token_order == FREQUENCY) {
-        q = std::priority_queue<art_node *, std::vector<const art_node *>,
-                std::function<bool(const art_node*, const art_node*)>>(compare_art_node_frequency_pq);
-    } else {
-        q = std::priority_queue<art_node *, std::vector<const art_node *>,
-                std::function<bool(const art_node*, const art_node*)>>(compare_art_node_score_pq);
+        q = std::priority_queue<const art_node *, std::vector<const art_node *>,
+                decltype(&compare_art_node_frequency_pq)>(compare_art_node_frequency_pq);
     }
 
     q.push(root);
@@ -1270,8 +1267,8 @@ static void art_fuzzy_recurse(char p, char c, const art_node *n, int depth, cons
         printf("\nIS_LEAF\nLEAF KEY: %s, depth: %d\n", l->key, depth);
 
         /*
-           For prefix search, when key is longer than term, we could potentially iterate till `term_len+max_cost` for:
-           term = `th`, leaf = `mathematics` - if we compared only first 2 chars, exceeds max_cost
+           For prefix search, when key is longer than term, we could potentially iterate till `term_len+max_cost`. E.g:
+           term = `th`, key = `mathematics` - if we compared only first 2 chars, it will exceed max_cost
            However, we refrain from doing so for performance reasons, or atleast until we hear strong objections.
 
            Also, for prefix searches we don't compare with full leaf key.
@@ -1289,9 +1286,22 @@ static void art_fuzzy_recurse(char p, char c, const art_node *n, int depth, cons
             depth++;
         }
 
-        // rows[j][columns-1] holds the final cost
-        if(rows[j][columns-1] >= min_cost && rows[j][columns-1] <= max_cost) {
+        /* `rows[j][columns-1]` holds the final cost, `cost` holds the intermediate cost.
+            We will use the intermediate cost if the term is shorter than the key.
+         */
+        if(prefix && term_len < (int) l->key_len && cost >= min_cost && cost <= max_cost) {
             results.push_back(n);
+            return;
+        }
+
+        if(prefix && term_len >= (int) l->key_len && rows[j][columns-1] >= min_cost && rows[j][columns-1] <= max_cost) {
+            results.push_back(n);
+            return;
+        }
+
+        if(!prefix && rows[j][columns-1] >= min_cost && rows[j][columns-1] <= max_cost) {
+            results.push_back(n);
+            return;
         }
 
         return ;
@@ -1344,7 +1354,7 @@ int art_fuzzy_search(art_tree *t, const unsigned char *term, const int term_len,
         irow[i] = i;
     }
 
-    auto begin = std::chrono::high_resolution_clock::now();
+    //auto begin = std::chrono::high_resolution_clock::now();
 
     if(IS_LEAF(t->root)) {
         art_leaf *l = (art_leaf *) LEAF_RAW(t->root);
@@ -1362,10 +1372,10 @@ int art_fuzzy_search(art_tree *t, const unsigned char *term, const int term_len,
         std::sort(nodes.begin(), nodes.end(), compare_art_node_score);
     }
 
-    long long int time_micro = microseconds(std::chrono::high_resolution_clock::now() - begin).count();
+    //long long int time_micro = microseconds(std::chrono::high_resolution_clock::now() - begin).count();
     //!LOG(INFO) << "Time taken for fuzz: " << time_micro << "us, size of nodes: " << nodes.size();
 
-    begin = std::chrono::high_resolution_clock::now();
+    //begin = std::chrono::high_resolution_clock::now();
 
     for(auto node: nodes) {
         art_topk_iter(node, token_order, max_words, results);
@@ -1377,7 +1387,7 @@ int art_fuzzy_search(art_tree *t, const unsigned char *term, const int term_len,
         std::sort(results.begin(), results.end(), compare_art_leaf_score);
     }
 
-    time_micro = microseconds(std::chrono::high_resolution_clock::now() - begin).count();
+    //time_micro = microseconds(std::chrono::high_resolution_clock::now() - begin).count();
     //!LOG(INFO) << "Time taken for art_topk_iter: " << time_micro << "us";
     return 0;
 }

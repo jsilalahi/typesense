@@ -19,6 +19,22 @@
 
 class Collection {
 private:
+
+    struct highlight_t {
+        std::string field;
+        std::vector<std::string> snippets;
+        std::vector<size_t> indices;
+        uint64_t match_score;
+
+        highlight_t() {
+
+        }
+
+        bool operator<(const highlight_t& a) const {
+            return match_score > a.match_score;
+        }
+    };
+
     std::string name;
 
     uint32_t collection_id;
@@ -51,6 +67,10 @@ private:
     std::string get_seq_id_key(uint32_t seq_id);
 
     Option<uint32_t> validate_index_in_memory(const nlohmann::json &document, uint32_t seq_id);
+
+    void highlight_result(const field &search_field, const std::vector<std::vector<art_leaf *>> &searched_queries,
+                          const Topster<512>::KV &field_order_kv, const nlohmann::json &document,
+                          StringUtils & string_utils, highlight_t &highlight);
 
 public:
     Collection() = delete;
@@ -96,7 +116,10 @@ public:
                           const std::string & simple_filter_query, const std::vector<std::string> & facet_fields,
                           const std::vector<sort_by> & sort_fields, const int num_typos,
                           const size_t per_page = 10, const size_t page = 1,
-                          const token_ordering token_order = FREQUENCY, const bool prefix = false);
+                          const token_ordering token_order = FREQUENCY, const bool prefix = false,
+                          const size_t drop_tokens_threshold = Index::DROP_TOKENS_THRESHOLD,
+                          const spp::sparse_hash_set<std::string> include_fields = spp::sparse_hash_set<std::string>(),
+                          const spp::sparse_hash_set<std::string> exclude_fields = spp::sparse_hash_set<std::string>());
 
     Option<nlohmann::json> get(const std::string & id);
 
@@ -104,11 +127,16 @@ public:
 
     Option<uint32_t> index_in_memory(const nlohmann::json & document, uint32_t seq_id);
 
+    static void prune_document(nlohmann::json &document, const spp::sparse_hash_set<std::string> include_fields,
+                               const spp::sparse_hash_set<std::string> exclude_fields);
+
     static const int MAX_SEARCH_TOKENS = 10;
     static const int MAX_RESULTS = 500;
 
     // strings under this length will be fully highlighted, instead of showing a snippet of relevant portion
     enum {SNIPPET_STR_ABOVE_LEN = 30};
+
+    enum {MAX_ARRAY_MATCHES = 5};
 
     // Using a $ prefix so that these meta keys stay above record entries in a lexicographically ordered KV store
     static constexpr const char* COLLECTION_META_PREFIX = "$CM";

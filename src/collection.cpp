@@ -9,7 +9,26 @@
 #include <thread>
 #include <chrono>
 #include <rocksdb/write_batch.h>
+#include "topster.h"
 #include "logger.h"
+
+struct match_index_t {
+    Match match;
+    uint64_t match_score = 0;
+    size_t index;
+
+    match_index_t(Match match, uint64_t match_score, size_t index): match(match), match_score(match_score),
+                                                                    index(index) {
+
+    }
+
+    bool operator<(const match_index_t& a) const {
+        if(match_score != a.match_score) {
+            return match_score > a.match_score;
+        }
+        return index < a.index;
+    }
+};
 
 Collection::Collection(const std::string name, const uint32_t collection_id, const uint32_t next_seq_id, Store *store,
                        const std::vector<field> &fields, const std::string & default_sorting_field,
@@ -117,7 +136,7 @@ Option<uint32_t> Collection::validate_index_in_memory(const nlohmann::json &docu
     }
 
     if(!document[default_sorting_field].is_number_integer() && !document[default_sorting_field].is_number_float()) {
-        return Option<>(400, "Default sorting field `" + default_sorting_field  + "` must be a number.");
+        return Option<>(400, "Default sorting field `" + default_sorting_field  + "` must be of type int32 or float.");
     }
 
     if(document[default_sorting_field].is_number_integer() &&
@@ -260,11 +279,26 @@ Option<uint32_t> Collection::index_in_memory(const nlohmann::json &document, uin
     return Option<>(200);
 }
 
+void Collection::prune_document(nlohmann::json &document, const spp::sparse_hash_set<std::string> include_fields,
+                                const spp::sparse_hash_set<std::string> exclude_fields) {
+    auto it = document.begin();
+    for(; it != document.end(); ) {
+        if(exclude_fields.count(it.key()) != 0 || (include_fields.size() != 0 && include_fields.count(it.key()) == 0)) {
+            it = document.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 Option<nlohmann::json> Collection::search(std::string query, const std::vector<std::string> search_fields,
                                   const std::string & simple_filter_query, const std::vector<std::string> & facet_fields,
                                   const std::vector<sort_by> & sort_fields, const int num_typos,
                                   const size_t per_page, const size_t page,
-                                  const token_ordering token_order, const bool prefix) {
+                                  const token_ordering token_order, const bool prefix,
+                                  const size_t drop_tokens_threshold,
+                                  const spp::sparse_hash_set<std::string> include_fields,
+                                  const spp::sparse_hash_set<std::string> exclude_fields) {
     std::vector<facet> facets;
 
     // validate search fields
@@ -375,6 +409,15 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
         filters.push_back(f);
     }
 
+    // for a wildcard query, if filter is not specified, use default_sorting_field as a catch-all
+    if(query == "*" && filters.size() == 0) {
+        field f = search_schema.at(default_sorting_field);
+        std::string max_value = f.is_float() ? std::to_string(std::numeric_limits<float>::max()) :
+                                std::to_string(std::numeric_limits<int32_t>::max());
+        filter catch_all_filter = {f.name, {max_value}, LESS_THAN_EQUALS};
+        filters.push_back(catch_all_filter);
+    }
+
     // validate facet fields
     for(const std::string & field_name: facet_fields) {
         if(facet_schema.count(field_name) == 0) {
@@ -415,7 +458,9 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
         return Option<nlohmann::json>(422, message);
     }
 
-    if((page * per_page) > MAX_RESULTS) {
+    const size_t num_results = (page * per_page);
+
+    if(num_results > MAX_RESULTS) {
         std::string message = "Only the first " + std::to_string(MAX_RESULTS) + " results are available.";
         return Option<nlohmann::json>(422, message);
     }
@@ -424,13 +469,13 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
 
     // all search queries that were used for generating the results
     std::vector<std::vector<art_leaf*>> searched_queries;
-    std::vector<std::pair<int, Topster<512>::KV>> field_order_kvs;
+    std::vector<Topster<512>::KV> field_order_kvs;
     size_t total_found = 0;
 
     // send data to individual index threads
     for(Index* index: indices) {
         index->search_params = search_args(query, search_fields, filters, facets, sort_fields_std,
-                                           num_typos, per_page, page, token_order, prefix);
+                                           num_typos, per_page, page, token_order, prefix, drop_tokens_threshold);
         {
             std::lock_guard<std::mutex> lk(index->m);
             index->ready = true;
@@ -459,9 +504,8 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
             continue;
         }
 
-        // need to remap the search query index before appending
         for(auto & field_order_kv: index->search_params.field_order_kvs) {
-            field_order_kv.second.query_index += searched_queries.size();
+            field_order_kv.query_index += searched_queries.size();
             field_order_kvs.push_back(field_order_kv);
         }
 
@@ -494,11 +538,7 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
     }
 
     // All fields are sorted descending
-    std::sort(field_order_kvs.begin(), field_order_kvs.end(),
-      [](const std::pair<int, Topster<512>::KV> & a, const std::pair<int, Topster<512>::KV> & b) {
-          return std::tie(a.second.match_score, a.second.primary_attr, a.second.secondary_attr, a.first, a.second.key) >
-                 std::tie(b.second.match_score, b.second.primary_attr, b.second.secondary_attr, b.first, b.second.key);
-    });
+    std::sort(field_order_kvs.begin(), field_order_kvs.end(), Topster<>::is_greater_kv_value);
 
     nlohmann::json result = nlohmann::json::object();
 
@@ -512,12 +552,12 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
         return Option<nlohmann::json>(result);
     }
 
-    const int end_result_index = std::min(int(page * per_page), kvsize) - 1;
+    const int end_result_index = std::min(int(num_results), kvsize) - 1;
 
     // construct results array
     for(int field_order_kv_index = start_result_index; field_order_kv_index <= end_result_index; field_order_kv_index++) {
         const auto & field_order_kv = field_order_kvs[field_order_kv_index];
-        const std::string& seq_id_key = get_seq_id_key((uint32_t) field_order_kv.second.key);
+        const std::string& seq_id_key = get_seq_id_key((uint32_t) field_order_kv.key);
 
         std::string json_doc_str;
         StoreStatus json_doc_status = store->get(seq_id_key, json_doc_str);
@@ -527,7 +567,6 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
             continue;
         }
 
-        nlohmann::json wrapper_doc;
         nlohmann::json document;
 
         try {
@@ -536,79 +575,42 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
             return Option<nlohmann::json>(500, "Error while parsing stored document.");
         }
 
-        wrapper_doc["document"] = document;
-        //wrapper_doc["match_score"] = field_order_kv.second.match_score;
-        //wrapper_doc["seq_id"] = (uint32_t) field_order_kv.second.key;
+        nlohmann::json wrapper_doc;
+        wrapper_doc["highlights"] = nlohmann::json::array();
+        std::vector<highlight_t> highlights;
+        StringUtils string_utils;
 
-        // highlight query words in the result
-        const std::string & field_name = search_fields[search_fields.size() - field_order_kv.first];
-        field search_field = search_schema.at(field_name);
-
-        // only string fields are supported for now
-        if(search_field.type == field_types::STRING) {
-            std::vector<std::string> tokens;
-            StringUtils::split(document[field_name], tokens, " ");
-
-            // positions in the document of each token in the query
-            std::vector<std::vector<uint16_t>> token_positions;
-
-            for (const art_leaf *token_leaf : searched_queries[field_order_kv.second.query_index]) {
-                std::vector<uint16_t> positions;
-                uint32_t doc_index = token_leaf->values->ids.indexOf(field_order_kv.second.key);
-                if(doc_index == token_leaf->values->ids.getLength()) {
-                    continue;
-                }
-
-                uint32_t start_offset = token_leaf->values->offset_index.at(doc_index);
-                uint32_t end_offset = (doc_index == token_leaf->values->ids.getLength() - 1) ?
-                                      token_leaf->values->offsets.getLength() :
-                                      token_leaf->values->offset_index.at(doc_index+1);
-
-                while(start_offset < end_offset) {
-                    positions.push_back((uint16_t) token_leaf->values->offsets.at(start_offset));
-                    start_offset++;
-                }
-
-                token_positions.push_back(positions);
-            }
-
-            Match match = Match::match(field_order_kv.second.key, token_positions);
-
-            // unpack `match.offset_diffs` into `token_indices`
-            std::vector<size_t> token_indices;
-            size_t num_tokens_found = (size_t) match.offset_diffs[0];
-            for(size_t i = 1; i <= num_tokens_found; i++) {
-                if(match.offset_diffs[i] != std::numeric_limits<int8_t>::max()) {
-                    size_t token_index = (size_t)(match.start_offset + match.offset_diffs[i]);
-                    token_indices.push_back(token_index);
+        for(const std::string & field_name: search_fields) {
+            field search_field = search_schema.at(field_name);
+            if(query != "*" && (search_field.type == field_types::STRING ||
+                                search_field.type == field_types::STRING_ARRAY)) {
+                highlight_t highlight;
+                highlight_result(search_field, searched_queries, field_order_kv, document, string_utils, highlight);
+                if(!highlight.snippets.empty()) {
+                    highlights.push_back(highlight);
                 }
             }
-
-            auto minmax = std::minmax_element(token_indices.begin(), token_indices.end());
-
-            // For longer strings, pick surrounding tokens within N tokens of min_index and max_index for the snippet
-            const size_t start_index = (tokens.size() <= SNIPPET_STR_ABOVE_LEN) ? 0 :
-                                       std::max(0, (int)(*(minmax.first)-5));
-
-            const size_t end_index = (tokens.size() <= SNIPPET_STR_ABOVE_LEN) ? tokens.size() :
-                                     std::min((int)tokens.size(), (int)(*(minmax.second)+5));
-
-            for(const size_t token_index: token_indices) {
-                tokens[token_index] = "<mark>" + tokens[token_index] + "</mark>";
-            }
-
-            std::stringstream snippet_stream;
-            for(size_t snippet_index = start_index; snippet_index < end_index; snippet_index++) {
-                if(snippet_index != start_index) {
-                    snippet_stream << " ";
-                }
-
-                snippet_stream << tokens[snippet_index];
-            }
-
-            wrapper_doc["highlight"] = nlohmann::json::object();
-            wrapper_doc["highlight"][field_name] = snippet_stream.str();
         }
+
+        std::sort(highlights.begin(), highlights.end());
+
+        for(const auto highlight: highlights) {
+            nlohmann::json h_json = nlohmann::json::object();
+            h_json["field"] = highlight.field;
+            if(!highlight.indices.empty()) {
+                h_json["indices"] = highlight.indices;
+                h_json["snippets"] = highlight.snippets;
+            } else {
+                h_json["snippet"] = highlight.snippets[0];
+            }
+
+            wrapper_doc["highlights"].push_back(h_json);
+        }
+
+        prune_document(document, include_fields, exclude_fields);
+        wrapper_doc["document"] = document;
+        //wrapper_doc["match_score"] = field_order_kv.match_score;
+        //wrapper_doc["seq_id"] = (uint32_t) field_order_kv.key;
 
         result["hits"].push_back(wrapper_doc);
     }
@@ -647,6 +649,122 @@ Option<nlohmann::json> Collection::search(std::string query, const std::vector<s
     //!LOG(INFO) << "Time taken for result calc: " << timeMillis << "us";
     //!store->print_memory_usage();
     return result;
+}
+
+void Collection::highlight_result(const field &search_field,
+                                  const std::vector<std::vector<art_leaf *>> &searched_queries,
+                                  const Topster<512>::KV & field_order_kv, const nlohmann::json & document,
+                                  StringUtils & string_utils, highlight_t & highlight) {
+    
+    spp::sparse_hash_map<const art_leaf*, uint32_t*> leaf_to_indices;
+    std::vector<art_leaf *> query_suggestion;
+
+    for (const art_leaf *token_leaf : searched_queries[field_order_kv.query_index]) {
+        // Must search for the token string fresh on that field for the given document since `token_leaf`
+        // is from the best matched field and need not be present in other fields of a document.
+        Index* index = indices[field_order_kv.key % num_indices];
+        art_leaf *actual_leaf = index->get_token_leaf(search_field.name, &token_leaf->key[0], token_leaf->key_len);
+        if(actual_leaf != NULL) {
+            query_suggestion.push_back(actual_leaf);
+            std::vector<uint16_t> positions;
+            uint32_t doc_index = actual_leaf->values->ids.indexOf(field_order_kv.key);
+            uint32_t *indices = new uint32_t[1];
+            indices[0] = doc_index;
+            leaf_to_indices.emplace(actual_leaf, indices);
+        }
+    }
+
+    // positions in the field of each token in the query
+    std::vector<std::vector<std::vector<uint16_t>>> array_token_positions;
+    Index::populate_token_positions(query_suggestion, leaf_to_indices, 0, array_token_positions);
+
+    if(array_token_positions.size() == 0) {
+        // none of the tokens from the query were found on this field
+        return ;
+    }
+
+    std::vector<match_index_t> match_indices;
+
+    for(size_t array_index = 0; array_index < array_token_positions.size(); array_index++) {
+        const std::vector<std::vector<uint16_t>> & token_positions = array_token_positions[array_index];
+
+        if(token_positions.empty()) {
+            continue;
+        }
+
+        const Match & this_match = Match::match(field_order_kv.key, token_positions);
+        uint64_t this_match_score = this_match.get_match_score(1, field_order_kv.field_id);
+        match_indices.push_back(match_index_t(this_match, this_match_score, array_index));
+    }
+
+    const size_t max_array_matches = std::min((size_t)MAX_ARRAY_MATCHES, match_indices.size());
+    std::partial_sort(match_indices.begin(), match_indices.begin()+max_array_matches, match_indices.end());
+
+    for(size_t index = 0; index < max_array_matches; index++) {
+        const match_index_t & match_index = match_indices[index];
+        const Match & match = match_index.match;
+
+        std::vector<std::string> tokens;
+        if(search_field.type == field_types::STRING) {
+            StringUtils::split(document[search_field.name], tokens, " ");
+        } else {
+            StringUtils::split(document[search_field.name][match_index.index], tokens, " ");
+        }
+
+        // unpack `match.offset_diffs` into `token_indices`
+        std::vector<size_t> token_indices;
+        spp::sparse_hash_set<std::string> token_hits;
+
+        size_t num_tokens_found = (size_t) match.offset_diffs[0];
+        for(size_t i = 1; i <= num_tokens_found; i++) {
+            if(match.offset_diffs[i] != std::numeric_limits<int8_t>::max()) {
+                size_t token_index = (size_t)(match.start_offset + match.offset_diffs[i]);
+                token_indices.push_back(token_index);
+                std::string token = tokens[token_index];
+                string_utils.unicode_normalize(token);
+                token_hits.insert(token);
+            }
+        }
+
+        auto minmax = std::minmax_element(token_indices.begin(), token_indices.end());
+
+        // For longer strings, pick surrounding tokens within N tokens of min_index and max_index for the snippet
+        const size_t start_index = (tokens.size() <= SNIPPET_STR_ABOVE_LEN) ? 0 :
+                                   std::max(0, (int)(*(minmax.first) - 5));
+
+        const size_t end_index = (tokens.size() <= SNIPPET_STR_ABOVE_LEN) ? tokens.size() :
+                                 std::min((int)tokens.size(), (int)(*(minmax.second) + 5));
+
+        std::stringstream snippet_stream;
+        for(size_t snippet_index = start_index; snippet_index < end_index; snippet_index++) {
+            if(snippet_index != start_index) {
+                snippet_stream << " ";
+            }
+
+            std::string token = tokens[snippet_index];
+            string_utils.unicode_normalize(token);
+
+            if(token_hits.count(token) != 0) {
+                snippet_stream << "<mark>" + tokens[snippet_index] + "</mark>";
+            } else {
+                snippet_stream << tokens[snippet_index];
+            }
+        }
+
+        highlight.snippets.push_back(snippet_stream.str());
+
+        if(search_field.type == field_types::STRING_ARRAY) {
+            highlight.indices.push_back(match_index.index);
+        }
+    }
+
+    highlight.field = search_field.name;
+    highlight.match_score = match_indices[0].match_score;
+
+    for (auto it = leaf_to_indices.begin(); it != leaf_to_indices.end(); it++) {
+        delete [] it->second;
+        it->second = nullptr;
+    }
 }
 
 Option<nlohmann::json> Collection::get(const std::string & id) {
